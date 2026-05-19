@@ -44,12 +44,24 @@ jobs:
           restore-keys: |
             buildozer-${{ runner.os }}-
 
+      - name: Instalar Android cmdline-tools donde Buildozer las espera
+        run: |
+          SDK_DIR=$HOME/.buildozer/android/platform/android-sdk
+          if [ ! -f "$SDK_DIR/tools/bin/sdkmanager" ]; then
+            mkdir -p $SDK_DIR
+            cd $SDK_DIR
+            wget -q https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -O /tmp/cmdline-tools.zip
+            unzip -q /tmp/cmdline-tools.zip
+            # Buildozer busca sdkmanager en tools/bin (ubicacion legacy)
+            mv cmdline-tools tools
+            rm /tmp/cmdline-tools.zip
+          fi
+
       - name: Pre-aceptar licencias del Android SDK
         run: |
-          mkdir -p ~/.android
-          touch ~/.android/repositories.cfg
-          mkdir -p ~/.buildozer/android/platform/android-sdk/licenses
-          cd ~/.buildozer/android/platform/android-sdk/licenses
+          SDK_DIR=$HOME/.buildozer/android/platform/android-sdk
+          mkdir -p $SDK_DIR/licenses
+          cd $SDK_DIR/licenses
           {
             echo "24333f8a63b6825ea9c5514f83c2829b004d1fee"
             echo "d56f5187479451eabf01fb78af6dfcb131a6481e"
@@ -63,6 +75,8 @@ jobs:
             echo "e9acab5b5fbb560a72cfaecce8946896ff6aab9d"
             echo "504667f4c0de7af1a06de9f4b1727b84351f2910"
           } > mips-android-sysimage-license
+          # Por si sdkmanager pregunta otras: aceptar todo lo restante
+          yes | $SDK_DIR/tools/bin/sdkmanager --sdk_root=$SDK_DIR --licenses > /dev/null 2>&1 || true
 
       - name: Instalar Buildozer y Cython
         run: |
