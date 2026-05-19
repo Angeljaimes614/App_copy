@@ -1,0 +1,8 @@
+# Dependencias para probar la app en PC (Windows/Linux/Mac).
+# En Android, Buildozer las instala automaticamente segun buildozer.spec.
+kivy
+requests
+websocket-client
+colorama
+python-dateutil
+telethon
