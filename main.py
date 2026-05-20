@@ -65,6 +65,9 @@ class BotEngine:
         self._code_future = None
         self._pwd_future = None
         self._stop_event = None
+        # Candado para serializar las compras en IQ (la API no oficial no
+        # es thread-safe, en paralelo puede perder ordenes).
+        self._buy_lock = None
 
     # ------- persistencia ---------
     def cargar_datos(self):
@@ -214,7 +217,12 @@ class BotEngine:
                     self.api.connect(); time.sleep(2)
                 return self.api.buy(self.datos["monto"], par, dir_, tf)
 
-            ok, info = await self.loop.run_in_executor(None, _comprar)
+            # Serializa las compras: la API no oficial pisa su propio
+            # estado interno si dos buy() corren a la vez.
+            if self._buy_lock is None:
+                self._buy_lock = asyncio.Lock()
+            async with self._buy_lock:
+                ok, info = await self.loop.run_in_executor(None, _comprar)
             if ok:
                 self.log_fn("  COPIADA  $%s  |  id %s" % (self.datos["monto"], info))
             else:
