@@ -133,7 +133,27 @@ class BotEngine:
             return False
         self.api = api
         self.log_fn("IQ Option OK   |   saldo $%s" % api.get_balance())
+
+        # Carga TODOS los activos disponibles (incluye los nuevos como cripto,
+        # memecoins, etc. que no estan en la lista estatica de la libreria).
+        await self.loop.run_in_executor(None, self._refrescar_activos)
         return True
+
+    def _refrescar_activos(self):
+        import iqoptionapi.constants as OP
+        try:
+            init = self.api.get_all_init()
+            for tipo in ("turbo", "binary"):
+                actives = init.get("result", {}).get(tipo, {}).get("actives", {})
+                for aid, info in actives.items():
+                    name = info.get("name", "")
+                    if "." in name:
+                        name = name[name.index(".") + 1:]
+                    if name:
+                        OP.ACTIVES[name] = int(aid)
+            self.log_fn("Activos cargados: %d" % len(OP.ACTIVES))
+        except Exception as e:
+            self.log_fn("aviso activos: " + repr(e))
 
     async def _login_telegram(self, telefono):
         if self.tg is None:
