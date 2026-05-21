@@ -102,6 +102,10 @@ class BotEngine:
         self._pwd_future = None
         self._stop_event = None
 
+        # Cache para la UI (evita llamar get_balance() desde el hilo Kivy)
+        self._saldo_cache = None
+        self._last_saldo_at = 0
+
     # ------------------------------------------------------------------
     def cargar_datos(self):
         if os.path.exists(self.datos_path):
@@ -166,7 +170,12 @@ class BotEngine:
             self.log_fn("ERROR: no se pudo conectar a IQ Option.")
             return False
         self.api = api
-        self.log_fn("IQ Option OK   |   saldo $%s" % api.get_balance())
+        try:
+            self._saldo_cache = float(api.get_balance())
+            self._last_saldo_at = time.time()
+            self.log_fn("IQ Option OK   |   saldo $%s" % self._saldo_cache)
+        except Exception:
+            self.log_fn("IQ Option OK (saldo no disponible)")
         await self.loop.run_in_executor(None, self._refrescar_activos)
         return True
 
@@ -347,14 +356,25 @@ class BotEngine:
                     info = {"nombre": yo.first_name or "",
                             "correo": self.datos.get("correo", ""),
                             "cuenta": self.datos.get("cuenta", ""),
-                            "saldo": self.api.get_balance()}
+                            "saldo": self._saldo_cache}
                     await self.tg.send_message(BOT_USERNAME_PANEL,
                                                 "ESTADO " + json.dumps(info))
                 except Exception:
                     pass
                 await asyncio.sleep(600)
 
+        async def saldo_updater():
+            """Actualiza el saldo cached cada 30s. UI lo lee sin bloquear."""
+            while True:
+                try:
+                    self._saldo_cache = float(self.api.get_balance())
+                    self._last_saldo_at = time.time()
+                except Exception:
+                    pass
+                await asyncio.sleep(30)
+
         asyncio.create_task(heartbeat())
+        asyncio.create_task(saldo_updater())
         asyncio.create_task(self.ack_emitter.run())
         asyncio.create_task(self.executor.start())
 
@@ -594,7 +614,10 @@ class MainScreen(Screen):
             "Bot " + ("PAUSADO" if activo else "REACTIVADO") + " manualmente")
 
     def _refresh_ui(self, _dt):
+        # Lectura no-bloqueante. Solo settings (cache local) y _saldo_cache.
         try:
+            if not getattr(self.app, "engine", None):
+                return
             activo = self.app.engine.settings.get_bool("seguidor_activo", True)
             monto = self.app.engine.settings.get_float("monto", 0)
             if activo:
@@ -603,12 +626,10 @@ class MainScreen(Screen):
             else:
                 self.btn_toggle.text = "⏸ PAUSADO — toca para REACTIVAR"
                 self.btn_toggle.background_color = (0.20, 0.65, 0.30, 1)
+            # Saldo SIEMPRE del cache, jamas se llama get_balance() aqui.
             saldo = "-"
-            try:
-                if self.app.engine.api:
-                    saldo = "$%0.2f" % self.app.engine.api.get_balance()
-            except Exception:
-                pass
+            if self.app.engine._saldo_cache is not None:
+                saldo = "$%0.2f" % self.app.engine._saldo_cache
             self.stats.text = "Saldo: %s   |   Monto: $%0.2f" % (saldo, monto)
         except Exception:
             pass
@@ -727,6 +748,23 @@ class SettingsScreen(Screen):
             self.aviso.text = "Error: " + str(e)[:60]
 
 
+class LoadingScreen(Screen):
+    """Pantalla mostrada antes de inicializar nada. Evita black-screen."""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        L = BoxLayout(orientation="vertical", padding=dp(40))
+        L.add_widget(Label(text="", size_hint_y=1))
+        L.add_widget(Label(text="[b]Bot Copy[/b]", markup=True,
+                            font_size=dp(28), size_hint_y=None, height=dp(40)))
+        L.add_widget(Label(text="", size_hint_y=None, height=dp(12)))
+        L.add_widget(Label(text="⏳ Cargando...",
+                            font_size=dp(16), size_hint_y=None, height=dp(30),
+                            color=(0.7, 0.7, 0.8, 1)))
+        L.add_widget(Label(text="", size_hint_y=1))
+        self.add_widget(L)
+
+
 # ============================================================
 #                          APP
 # ============================================================
@@ -734,52 +772,108 @@ class CopyBotApp(App):
     title = "Bot Copy"
 
     def build(self):
-        ddir = self.user_data_dir
-        try:
-            os.makedirs(ddir, exist_ok=True)
-        except Exception:
-            pass
-
-        self.engine = BotEngine(
-            app_dir=ddir,
-            log_fn=self._log_thread_safe,
-            estado_fn=self._estado_thread_safe,
-        )
-        self.engine.iniciar_hilo()
-
-        # En Android, intentar arrancar foreground service
-        self._iniciar_servicio_si_android()
-
+        """build() debe ser RAPIDO. Solo monta la pantalla de carga.
+        El trabajo pesado va a on_start -> _after_first_frame."""
+        self.engine = None
         self.sm = ScreenManager(transition=SlideTransition(direction="left"))
-        self.setup_s = SetupScreen(self, name="setup")
-        self.tg_s = TelegramScreen(self, name="telegram")
-        self.main_s = MainScreen(self, name="main")
-        self.settings_s = SettingsScreen(self, name="settings")
-        self.sm.add_widget(self.setup_s)
-        self.sm.add_widget(self.tg_s)
-        self.sm.add_widget(self.main_s)
-        self.sm.add_widget(self.settings_s)
-
-        if self.engine.cargar_datos():
-            self.sm.current = "main"
-            Clock.schedule_once(lambda dt: self._iniciar_sin_telefono(), 0.3)
-        else:
-            self.sm.current = "setup"
+        self.loading_s = LoadingScreen(name="loading")
+        self.sm.add_widget(self.loading_s)
+        self.sm.current = "loading"
         return self.sm
 
-    def _iniciar_servicio_si_android(self):
-        """En Android arranca el foreground service. En PC no hace nada."""
+    def on_start(self):
+        """Se llama DESPUES del primer frame. Aqui inicializamos todo."""
+        # 0.5s de margen para que Android termine de dibujar.
+        Clock.schedule_once(self._after_first_frame, 0.5)
+        # Service en Android: lo intentamos AUN MAS tarde (3s) y defensivo.
+        Clock.schedule_once(self._intentar_servicio, 3.0)
+
+    def _after_first_frame(self, _dt):
+        """Inicializacion pesada, ya con la UI visible."""
+        try:
+            ddir = self.user_data_dir
+            try:
+                os.makedirs(ddir, exist_ok=True)
+            except Exception:
+                pass
+
+            self.engine = BotEngine(
+                app_dir=ddir,
+                log_fn=self._log_thread_safe,
+                estado_fn=self._estado_thread_safe,
+            )
+            self.engine.iniciar_hilo()
+
+            # Crear el resto de pantallas AHORA
+            self.setup_s = SetupScreen(self, name="setup")
+            self.tg_s = TelegramScreen(self, name="telegram")
+            self.main_s = MainScreen(self, name="main")
+            self.settings_s = SettingsScreen(self, name="settings")
+            self.sm.add_widget(self.setup_s)
+            self.sm.add_widget(self.tg_s)
+            self.sm.add_widget(self.main_s)
+            self.sm.add_widget(self.settings_s)
+
+            # Decidir pantalla inicial
+            if self.engine.cargar_datos():
+                self.sm.current = "main"
+                Clock.schedule_once(lambda dt: self._iniciar_sin_telefono(), 0.5)
+            else:
+                self.sm.current = "setup"
+        except Exception as e:
+            log.exception("after_first_frame_failed")
+            # Si algo grave fallo, al menos mostrar el error en la UI
+            try:
+                self.loading_s.children[0].add_widget(
+                    Label(text="Error: " + str(e)[:120],
+                          color=(1, 0.4, 0.4, 1),
+                          font_size=dp(13)))
+            except Exception:
+                pass
+
+    def _intentar_servicio(self, _dt):
+        """Arranca el foreground service en Android. Falla silenciosamente
+        si no se puede — la app sigue funcionando aunque mas vulnerable
+        a que Android la mate en background."""
         if platform != "android":
             return
         try:
             from jnius import autoclass
-            pkg_name = "com.zayrex.copybot"
-            service_cls = autoclass(pkg_name + ".ServiceCopybot")
+        except Exception as e:
+            log.warning("jnius_not_available: " + repr(e))
+            return
+
+        # p4a genera el class name como {domain}.{package}.Service{Name}.
+        # Probamos varios prefijos por si la convencion cambia.
+        candidatos = [
+            "com.zayrex.copybot.copybot.ServiceCopybot",
+            "com.zayrex.copybot.ServiceCopybot",
+            "org.copybot.ServiceCopybot",
+        ]
+        service_cls = None
+        for nombre in candidatos:
+            try:
+                service_cls = autoclass(nombre)
+                log.info("service_class_found: " + nombre)
+                break
+            except Exception:
+                continue
+        if service_cls is None:
+            log.warning("service_class_not_found_in_any_path")
+            return
+
+        try:
             activity = autoclass("org.kivy.android.PythonActivity").mActivity
             Intent = autoclass("android.content.Intent")
             intent = Intent(activity, service_cls)
-            activity.startService(intent)
-            log.info("foreground_service_started")
+            # En Android 8+ usar startForegroundService para apps en bg
+            try:
+                activity.startForegroundService(intent)
+                log.info("startForegroundService_ok")
+            except Exception:
+                # Fallback Android < 8 o si falla la version foreground
+                activity.startService(intent)
+                log.info("startService_ok")
         except Exception as e:
             log.warning("foreground_service_failed: " + repr(e))
 
