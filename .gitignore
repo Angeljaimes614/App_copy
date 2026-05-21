@@ -1,0 +1,21 @@
+# Build artifacts
+.buildozer/
+bin/
+build/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Logs y datos runtime
+logs/
+*.db
+*.session
+*.session-journal
+mis_datos.json
+mis_datos.txt
+
+# IDE
+.vscode/
+.idea/
