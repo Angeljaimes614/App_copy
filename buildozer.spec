@@ -10,7 +10,7 @@ source.include_exts = py,kv,json,pem,png,jpg,jpeg,atlas,ttf,sql
 # Incluye paquetes locales: iqoptionapi (broker) + core (cimiento) + migrations
 source.include_patterns = iqoptionapi/*,iqoptionapi/**/*,core/*,core/**/*,migrations/*
 
-version = 0.2
+version = 0.3
 
 # Dependencias de Python
 requirements = python3,kivy,requests,urllib3,charset-normalizer,certifi,idna,websocket-client,colorama,python-dateutil,six,telethon,pyaes,rsa,pyasn1
@@ -18,8 +18,12 @@ requirements = python3,kivy,requests,urllib3,charset-normalizer,certifi,idna,web
 orientation = portrait
 fullscreen = 0
 
-# Permisos de Android
-android.permissions = INTERNET, WAKE_LOCK, FOREGROUND_SERVICE
+# Permisos de Android (FOREGROUND_SERVICE_DATA_SYNC = Android 14+)
+android.permissions = INTERNET, WAKE_LOCK, FOREGROUND_SERVICE, FOREGROUND_SERVICE_DATA_SYNC, POST_NOTIFICATIONS
+
+# Foreground service: corre el engine en background indefinidamente
+# Formato: NOMBRE:script.py:foreground
+services = Copybot:service_copybot.py:foreground
 
 # Niveles de API
 android.api = 31

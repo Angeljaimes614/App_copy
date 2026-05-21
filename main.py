@@ -2,13 +2,15 @@
 """
 main.py  -  Bot SEGUIDOR de copy trading (Kivy, Android + Windows).
 
-Esta version integra el cimiento de endurecimiento:
-  - SQLite WAL + 3 migraciones
-  - signal_id ULID + dedupe persistente
-  - State machine de 10 estados con ACK pipeline
-  - TradeExecutor (asyncio.Queue + retry policy)
-  - StopGuard (stop_win / stop_loss / max_trades_dia)
-  - Settings dinamicos (monto, seguidor_activo en caliente)
+v0.3: UI con controles + Martingala + Foreground Service para background.
+
+Pantallas:
+  - SetupScreen      : datos IQ
+  - TelegramScreen   : login telegram (phone + code)
+  - MainScreen       : status + ON/OFF + log + acceso a ajustes
+  - SettingsScreen   : monto, stop_win, stop_loss, max_trades, martingala
+
+En Android arranca un foreground service para sobrevivir background.
 """
 
 import asyncio
@@ -26,23 +28,26 @@ from kivy.clock import Clock
 from kivy.metrics import dp
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.button import Button
+from kivy.uix.checkbox import CheckBox
 from kivy.uix.label import Label
 from kivy.uix.screenmanager import ScreenManager, Screen, SlideTransition
 from kivy.uix.scrollview import ScrollView
 from kivy.uix.spinner import Spinner
 from kivy.uix.textinput import TextInput
+from kivy.utils import platform
 
 # Telethon + IQ
 from iqoptionapi.stable_api import IQ_Option
 from telethon import TelegramClient, events
 from telethon.errors import SessionPasswordNeededError
 
-# Endurecimiento (mismo cimiento que seguidor.py)
+# Cimiento + Martingala
 from core.db import open_db
 from core.ack import AckEmitter, StateTracker
 from core.executor import TradeExecutor
 from core.settings import Settings
 from core.stops import StopGuard
+from core.martingala import Martingala
 from core.logging_setup import setup as setup_logging, get_logger, set_correlation
 
 setup_logging("app_seguidor")
@@ -65,48 +70,39 @@ ARCHIVO_DATOS = "mis_datos.json"
 #                   MOTOR DEL BOT
 # ============================================================
 class BotEngine:
-    """Maneja IQ Option + Telegram en su propio hilo con asyncio loop.
-    Plumbing del cimiento: ack emitter, executor, stop guard, settings."""
+    """Maneja IQ Option + Telegram + martingala. Vive en su propio hilo
+    con asyncio loop independiente del de Kivy."""
 
     def __init__(self, app_dir, log_fn, estado_fn):
-        # Paths
         self.app_dir = app_dir
         self.datos_path = os.path.join(app_dir, ARCHIVO_DATOS)
         self.sesion_path = os.path.join(app_dir, "seguidor_session")
         self.db_path = os.path.join(app_dir, "seguidor_local.db")
 
-        # Callbacks a la UI
         self.log_fn = log_fn
         self.estado_fn = estado_fn
 
-        # SQLite + settings (no requieren IQ aun)
         self.db = open_db(self.db_path)
         self.settings = Settings(self.db)
-        # Por defecto bot activo
         if self.settings.get("seguidor_activo") is None:
             self.settings.set("seguidor_activo", True)
 
-        # Async / threading
         self.loop = None
         self.thread = None
-
-        # Conexiones (se rellenan en runtime)
         self.tg = None
         self.api = None
         self.ack_emitter = None
         self.tracker = None
         self.executor = None
         self.stop_guard = None
-
-        # Datos personales
+        self.martingala = None
         self.datos = None
 
-        # Telegram async coordination
         self._code_future = None
         self._pwd_future = None
         self._stop_event = None
 
-    # ----- persistencia de IQ creds -------------------------------------
+    # ------------------------------------------------------------------
     def cargar_datos(self):
         if os.path.exists(self.datos_path):
             try:
@@ -120,11 +116,10 @@ class BotEngine:
         self.datos = datos
         with open(self.datos_path, "w", encoding="utf-8") as f:
             json.dump(datos, f, indent=2, ensure_ascii=False)
-        # Sincroniza monto a settings para uso live
         if self.settings.get("monto") is None:
             self.settings.set("monto", datos.get("monto", 5.0))
 
-    # ----- hilo dedicado -----------------------------------------------
+    # ------------------------------------------------------------------
     def iniciar_hilo(self):
         if self.thread and self.thread.is_alive():
             return
@@ -143,7 +138,6 @@ class BotEngine:
     def lanzar(self, coro):
         return asyncio.run_coroutine_threadsafe(coro, self.loop)
 
-    # ----- UI -> async loop (codigo / password) ------------------------
     def dar_codigo(self, codigo):
         if self._code_future and not self._code_future.done():
             self.loop.call_soon_threadsafe(self._code_future.set_result, codigo)
@@ -152,7 +146,7 @@ class BotEngine:
         if self._pwd_future and not self._pwd_future.done():
             self.loop.call_soon_threadsafe(self._pwd_future.set_result, pwd)
 
-    # ----- conexiones --------------------------------------------------
+    # ------------------------------------------------------------------
     async def _conectar_iq(self):
         self.log_fn("Conectando a IQ Option...")
 
@@ -173,8 +167,6 @@ class BotEngine:
             return False
         self.api = api
         self.log_fn("IQ Option OK   |   saldo $%s" % api.get_balance())
-
-        # Cargar TODOS los activos para soportar pares nuevos
         await self.loop.run_in_executor(None, self._refrescar_activos)
         return True
 
@@ -250,23 +242,34 @@ class BotEngine:
         self.log_fn("Telegram OK   |   " + (yo.first_name or "?"))
         return True
 
-    # ----- handler de senales + executor ------------------------------
+    # ------------------------------------------------------------------
     async def _escuchar(self):
-        # Inicializa pipeline ahora que IQ y TG estan listos
+        # Pipeline completo
         self.ack_emitter = AckEmitter(self.db, self.tg, BOT_USERNAME_PANEL)
         self.tracker = StateTracker(self.ack_emitter)
         self.stop_guard = StopGuard(self.api, self.settings)
 
         async def buy_async(signal):
-            monto_actual = self.settings.get_float(
-                "monto", self.datos.get("monto", 5.0))
+            if signal.get("_monto_override") is not None:
+                monto_actual = float(signal["_monto_override"])
+            else:
+                monto_actual = self.settings.get_float(
+                    "monto", self.datos.get("monto", 5.0))
             return await self.loop.run_in_executor(
-                None, self._buy_sync,
-                monto_actual, signal["par"], signal["dir"],
-                int(signal.get("tf", 1)))
+                None, self._buy_sync, monto_actual,
+                signal["par"], signal["dir"], int(signal.get("tf", 1)))
+
+        self.martingala = Martingala(self.api, self.settings,
+                                      executor=None,
+                                      stop_guard=self.stop_guard)
+
+        async def on_trade_executed(signal, order_id):
+            await self.martingala.tras_ejecutar(signal, order_id)
 
         self.executor = TradeExecutor(
-            buy_async=buy_async, tracker=self.tracker)
+            buy_async=buy_async, tracker=self.tracker,
+            on_executed=on_trade_executed)
+        self.martingala.executor = self.executor
 
         @self.tg.on(events.NewMessage(chats=TG_CANAL))
         async def manejador(event):
@@ -284,13 +287,12 @@ class BotEngine:
 
             set_correlation(signal_id)
 
-            # Kill-switch manual: silencio total
+            # Kill-switch local
             if not self.settings.get_bool("seguidor_activo", True):
                 return
 
             self.tracker.transition(signal_id, "recibida")
 
-            # v check
             v = s.get("v", 1)
             if v not in PROTO_SOPORTADO:
                 self.tracker.transition(signal_id, "fallida_sistema",
@@ -298,7 +300,6 @@ class BotEngine:
                                          error_kind="system")
                 return
 
-            # dedupe persistente
             try:
                 self.db.exec(
                     "INSERT INTO processed_signals (signal_id, seen_at) "
@@ -307,7 +308,7 @@ class BotEngine:
                 self.tracker.transition(signal_id, "duplicada")
                 return
 
-            # stops
+            # Stops
             ok_stops, reason = self.stop_guard.check()
             if not ok_stops:
                 self.log_fn("BLOQUEO por stop: %s" % reason)
@@ -315,7 +316,6 @@ class BotEngine:
                                          error=reason, error_kind="system")
                 return
 
-            # payload + freshness
             par = s.get("par")
             direccion = s.get("dir")
             tf = int(s.get("tf", 1))
@@ -337,7 +337,6 @@ class BotEngine:
                 par, direccion.upper(), tf, retraso))
             self.tracker.transition(signal_id, "validada")
 
-            # delegar al executor (queue + workers + retry)
             if self.executor.submit(s):
                 self.stop_guard.increment_trades()
 
@@ -355,7 +354,6 @@ class BotEngine:
                     pass
                 await asyncio.sleep(600)
 
-        # tareas de background
         asyncio.create_task(heartbeat())
         asyncio.create_task(self.ack_emitter.run())
         asyncio.create_task(self.executor.start())
@@ -384,7 +382,7 @@ class BotEngine:
 
 
 # ============================================================
-#                    PANTALLAS DE LA UI
+#                    UI HELPERS
 # ============================================================
 def _input(**kw):
     return TextInput(multiline=False, write_tab=False,
@@ -403,12 +401,23 @@ def _etiqueta(txt):
                  text_size=(None, dp(28)))
 
 
+def _seccion(txt):
+    return Label(text="[b][color=94a3b8]" + txt + "[/color][/b]",
+                 markup=True, font_size=dp(13),
+                 size_hint_y=None, height=dp(36),
+                 halign="left", valign="bottom",
+                 text_size=(None, dp(36)))
+
+
 def _boton(txt, color):
     return Button(text=txt, size_hint_y=None, height=dp(56),
                   font_size=dp(18), background_color=color,
                   background_normal="")
 
 
+# ============================================================
+#                    PANTALLAS
+# ============================================================
 class SetupScreen(Screen):
     def __init__(self, app, **kw):
         super().__init__(**kw)
@@ -520,17 +529,50 @@ class TelegramScreen(Screen):
 
 
 class MainScreen(Screen):
+    """Pantalla principal con ON/OFF prominente + status + log."""
+
     def __init__(self, app, **kw):
         super().__init__(**kw)
         self.app = app
-        L = BoxLayout(orientation="vertical", padding=dp(16), spacing=dp(8))
-        L.add_widget(_titulo("Bot Copy"))
+        L = BoxLayout(orientation="vertical", padding=dp(12), spacing=dp(8))
+
+        # Header: titulo + boton ajustes
+        header = BoxLayout(size_hint_y=None, height=dp(50))
+        header.add_widget(Label(text="[b]Bot Copy[/b]", markup=True,
+                                 font_size=dp(22), halign="left",
+                                 text_size=(None, dp(50))))
+        btn_aj = Button(text="⚙ Ajustes", size_hint_x=None, width=dp(110),
+                         font_size=dp(15),
+                         background_color=(0.3, 0.3, 0.4, 1),
+                         background_normal="")
+        btn_aj.bind(on_press=lambda _: setattr(app.sm, "current", "settings"))
+        header.add_widget(btn_aj)
+        L.add_widget(header)
+
+        # Estado actual
         self.estado = Label(text="Iniciando...", size_hint_y=None,
-                             height=dp(40), color=(1, 0.8, 0.2, 1),
-                             font_size=dp(16))
+                             height=dp(38), font_size=dp(16),
+                             color=(1, 0.8, 0.2, 1))
         L.add_widget(self.estado)
+
+        # GRAN boton ON/OFF
+        self.btn_toggle = Button(text="...", size_hint_y=None, height=dp(72),
+                                  font_size=dp(20), bold=True,
+                                  background_normal="",
+                                  background_color=(0.5, 0.5, 0.5, 1))
+        self.btn_toggle.bind(on_press=self._toggle)
+        L.add_widget(self.btn_toggle)
+
+        # Linea de stats
+        self.stats = Label(text="Saldo: -   |   Monto: -",
+                           size_hint_y=None, height=dp(30),
+                           font_size=dp(13), color=(0.7, 0.7, 0.8, 1))
+        L.add_widget(self.stats)
+
+        # Log
+        L.add_widget(_seccion("LOG"))
         scroll = ScrollView()
-        self.log = Label(text="", size_hint_y=None, font_size=dp(13),
+        self.log = Label(text="", size_hint_y=None, font_size=dp(12),
                           halign="left", valign="top",
                           color=(0.9, 0.9, 0.9, 1))
         self.log.bind(width=lambda inst, val:
@@ -539,7 +581,37 @@ class MainScreen(Screen):
                        setattr(inst, "height", val[1]))
         scroll.add_widget(self.log)
         L.add_widget(scroll)
+
         self.add_widget(L)
+        # Repintar el boton segun estado al entrar
+        Clock.schedule_interval(self._refresh_ui, 2)
+
+    def _toggle(self, _):
+        activo = self.app.engine.settings.get_bool("seguidor_activo", True)
+        self.app.engine.settings.set("seguidor_activo", not activo)
+        self._refresh_ui(0)
+        self.app.main_s.agregar_log(
+            "Bot " + ("PAUSADO" if activo else "REACTIVADO") + " manualmente")
+
+    def _refresh_ui(self, _dt):
+        try:
+            activo = self.app.engine.settings.get_bool("seguidor_activo", True)
+            monto = self.app.engine.settings.get_float("monto", 0)
+            if activo:
+                self.btn_toggle.text = "🟢 ACTIVO — toca para PAUSAR"
+                self.btn_toggle.background_color = (0.85, 0.30, 0.30, 1)
+            else:
+                self.btn_toggle.text = "⏸ PAUSADO — toca para REACTIVAR"
+                self.btn_toggle.background_color = (0.20, 0.65, 0.30, 1)
+            saldo = "-"
+            try:
+                if self.app.engine.api:
+                    saldo = "$%0.2f" % self.app.engine.api.get_balance()
+            except Exception:
+                pass
+            self.stats.text = "Saldo: %s   |   Monto: $%0.2f" % (saldo, monto)
+        except Exception:
+            pass
 
     def agregar_log(self, msg):
         marca = datetime.now().strftime("%H:%M:%S")
@@ -550,6 +622,109 @@ class MainScreen(Screen):
         lineas = self.log.text.split("\n")
         if len(lineas) > 200:
             self.log.text = "\n".join(lineas[-200:])
+
+
+class SettingsScreen(Screen):
+    """Pantalla de ajustes: monto, stops, martingala."""
+
+    def __init__(self, app, **kw):
+        super().__init__(**kw)
+        self.app = app
+
+        outer = BoxLayout(orientation="vertical", padding=dp(10), spacing=dp(6))
+
+        # Header
+        header = BoxLayout(size_hint_y=None, height=dp(50))
+        b_back = Button(text="← Volver", size_hint_x=None, width=dp(110),
+                         font_size=dp(15),
+                         background_color=(0.3, 0.3, 0.4, 1),
+                         background_normal="")
+        b_back.bind(on_press=lambda _: setattr(app.sm, "current", "main"))
+        header.add_widget(b_back)
+        header.add_widget(Label(text="[b]Ajustes[/b]", markup=True,
+                                 font_size=dp(20)))
+        outer.add_widget(header)
+
+        # Scroll de campos
+        scroll = ScrollView()
+        cont = BoxLayout(orientation="vertical", padding=dp(10), spacing=dp(8),
+                          size_hint_y=None)
+        cont.bind(minimum_height=cont.setter("height"))
+
+        cont.add_widget(_seccion("💰 OPERACION"))
+        cont.add_widget(_etiqueta("Monto por operacion (USD):"))
+        self.monto = _input(input_filter="float")
+        cont.add_widget(self.monto)
+
+        cont.add_widget(_seccion("🛡 GESTION DE RIESGO"))
+        cont.add_widget(_etiqueta("Stop WIN (ganar X y parar — vacio = sin tope):"))
+        self.stop_win = _input(input_filter="float")
+        cont.add_widget(self.stop_win)
+        cont.add_widget(_etiqueta("Stop LOSS (perder X y parar — vacio = sin tope):"))
+        self.stop_loss = _input(input_filter="float")
+        cont.add_widget(self.stop_loss)
+        cont.add_widget(_etiqueta("Max trades/dia (vacio = sin tope):"))
+        self.max_trades = _input(input_filter="int")
+        cont.add_widget(self.max_trades)
+
+        cont.add_widget(_seccion("🎲 MARTINGALA"))
+        cont.add_widget(Label(
+            text="⚠ Riesgo alto. SOLO funciona si Stop LOSS esta configurado.",
+            color=(1, 0.7, 0.2, 1), size_hint_y=None, height=dp(40),
+            font_size=dp(13), text_size=(None, dp(40))))
+        mg_row = BoxLayout(size_hint_y=None, height=dp(40), spacing=dp(8))
+        mg_row.add_widget(Label(text="Activar martingala", font_size=dp(15),
+                                  halign="left"))
+        self.mg_activa = CheckBox(size_hint_x=None, width=dp(50))
+        mg_row.add_widget(self.mg_activa)
+        cont.add_widget(mg_row)
+        cont.add_widget(_etiqueta("Multiplicador (ej. 2.2):"))
+        self.mg_mult = _input(input_filter="float")
+        cont.add_widget(self.mg_mult)
+        cont.add_widget(_etiqueta("Niveles maximos (ej. 2):"))
+        self.mg_niveles = _input(input_filter="int")
+        cont.add_widget(self.mg_niveles)
+
+        scroll.add_widget(cont)
+        outer.add_widget(scroll)
+
+        # Aviso + Guardar
+        self.aviso = Label(text="", size_hint_y=None, height=dp(30),
+                            color=(0.4, 0.85, 0.5, 1), font_size=dp(14))
+        outer.add_widget(self.aviso)
+        b_save = _boton("Guardar cambios", (0.20, 0.65, 0.30, 1))
+        b_save.bind(on_press=self._guardar)
+        outer.add_widget(b_save)
+
+        self.add_widget(outer)
+
+    def on_enter(self):
+        """Cuando entra a la pantalla, carga valores actuales."""
+        s = self.app.engine.settings
+        self.monto.text       = str(s.get_float("monto", 0) or "")
+        self.stop_win.text    = s.get("stop_win") or ""
+        self.stop_loss.text   = s.get("stop_loss") or ""
+        self.max_trades.text  = s.get("max_trades_dia") or ""
+        self.mg_activa.active = s.get_bool("martingala_activa", False)
+        self.mg_mult.text     = str(s.get_float("martingala_mult", 2.2))
+        self.mg_niveles.text  = str(s.get_int("martingala_niveles", 2))
+
+    def _guardar(self, _):
+        s = self.app.engine.settings
+        try:
+            if self.monto.text.strip():
+                s.set("monto", float(self.monto.text))
+            s.set("stop_win", self.stop_win.text.strip())
+            s.set("stop_loss", self.stop_loss.text.strip())
+            s.set("max_trades_dia", self.max_trades.text.strip())
+            s.set("martingala_activa", self.mg_activa.active)
+            if self.mg_mult.text.strip():
+                s.set("martingala_mult", float(self.mg_mult.text))
+            if self.mg_niveles.text.strip():
+                s.set("martingala_niveles", int(self.mg_niveles.text))
+            self.aviso.text = "✓ Guardado. Cambios aplican en proxima senal."
+        except Exception as e:
+            self.aviso.text = "Error: " + str(e)[:60]
 
 
 # ============================================================
@@ -572,13 +747,18 @@ class CopyBotApp(App):
         )
         self.engine.iniciar_hilo()
 
+        # En Android, intentar arrancar foreground service
+        self._iniciar_servicio_si_android()
+
         self.sm = ScreenManager(transition=SlideTransition(direction="left"))
         self.setup_s = SetupScreen(self, name="setup")
         self.tg_s = TelegramScreen(self, name="telegram")
         self.main_s = MainScreen(self, name="main")
+        self.settings_s = SettingsScreen(self, name="settings")
         self.sm.add_widget(self.setup_s)
         self.sm.add_widget(self.tg_s)
         self.sm.add_widget(self.main_s)
+        self.sm.add_widget(self.settings_s)
 
         if self.engine.cargar_datos():
             self.sm.current = "main"
@@ -586,6 +766,22 @@ class CopyBotApp(App):
         else:
             self.sm.current = "setup"
         return self.sm
+
+    def _iniciar_servicio_si_android(self):
+        """En Android arranca el foreground service. En PC no hace nada."""
+        if platform != "android":
+            return
+        try:
+            from jnius import autoclass
+            pkg_name = "com.zayrex.copybot"
+            service_cls = autoclass(pkg_name + ".ServiceCopybot")
+            activity = autoclass("org.kivy.android.PythonActivity").mActivity
+            Intent = autoclass("android.content.Intent")
+            intent = Intent(activity, service_cls)
+            activity.startService(intent)
+            log.info("foreground_service_started")
+        except Exception as e:
+            log.warning("foreground_service_failed: " + repr(e))
 
     def _log_thread_safe(self, msg):
         Clock.schedule_once(lambda dt: self.main_s.agregar_log(msg), 0)
@@ -605,15 +801,15 @@ class CopyBotApp(App):
             self.tg_s.set_modo("password")
         elif nombre == "escuchando":
             self.sm.current = "main"
-            self.main_s.estado.text = "Conectado - escuchando senales"
+            self.main_s.estado.text = "🟢 Conectado - escuchando senales"
             self.main_s.estado.color = (0.25, 0.85, 0.45, 1)
         elif nombre == "error_iq":
             self.sm.current = "main"
-            self.main_s.estado.text = "Error al conectar IQ Option"
+            self.main_s.estado.text = "❌ Error al conectar IQ Option"
             self.main_s.estado.color = (1, 0.35, 0.35, 1)
         elif nombre == "error_tg":
             self.sm.current = "main"
-            self.main_s.estado.text = "Error al conectar Telegram"
+            self.main_s.estado.text = "❌ Error al conectar Telegram"
             self.main_s.estado.color = (1, 0.35, 0.35, 1)
 
     def ir_a_telegram_telefono(self):
@@ -627,7 +823,7 @@ class CopyBotApp(App):
         self.engine.lanzar(self.engine.correr(None))
 
     def on_pause(self):
-        # Android: mantener la app viva en background
+        # Android: mantener viva la app cuando va a background
         return True
 
     def on_resume(self):
