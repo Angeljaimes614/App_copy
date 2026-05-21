@@ -1,18 +1,21 @@
 # -*- coding: utf-8 -*-
 """
-main.py  -  Bot SEGUIDOR de copy trading con interfaz grafica.
+main.py  -  Bot SEGUIDOR de copy trading (Kivy, Android + Windows).
 
-Funciona en:
-  - Windows / Linux / Mac (corre con: python main.py)
-  - Android (compilado a APK con Buildozer)
-
-La primera vez te pide tus datos (correo IQ, contrasena, monto) y
-te conecta a Telegram. Despues, en cada arranque, sigue copiando solo.
+Esta version integra el cimiento de endurecimiento:
+  - SQLite WAL + 3 migraciones
+  - signal_id ULID + dedupe persistente
+  - State machine de 10 estados con ACK pipeline
+  - TradeExecutor (asyncio.Queue + retry policy)
+  - StopGuard (stop_win / stop_loss / max_trades_dia)
+  - Settings dinamicos (monto, seguidor_activo en caliente)
 """
 
 import asyncio
 import json
 import os
+import sqlite3
+import sys
 import threading
 import time
 from datetime import datetime
@@ -29,47 +32,81 @@ from kivy.uix.scrollview import ScrollView
 from kivy.uix.spinner import Spinner
 from kivy.uix.textinput import TextInput
 
-# Bot
+# Telethon + IQ
 from iqoptionapi.stable_api import IQ_Option
 from telethon import TelegramClient, events
 from telethon.errors import SessionPasswordNeededError
 
-# ===== Datos FIJOS del sistema (iguales para todos los seguidores) =========
+# Endurecimiento (mismo cimiento que seguidor.py)
+from core.db import open_db
+from core.ack import AckEmitter, StateTracker
+from core.executor import TradeExecutor
+from core.settings import Settings
+from core.stops import StopGuard
+from core.logging_setup import setup as setup_logging, get_logger, set_correlation
+
+setup_logging("app_seguidor")
+log = get_logger("app")
+
+# ===== Datos FIJOS del sistema =============================================
 TG_API_ID = 31988246
 TG_API_HASH = "5095046560758805ca1abf53b6acf2f8"
 TG_CANAL = -1003745991669
-BOT_USERNAME = "@Copy_zayrex_bot"
+BOT_USERNAME_PANEL = "@Copy_zayrex_bot"
 # ===========================================================================
 
+PROTO_SOPORTADO = (1,)
 PREFIJO = "COPYSENAL "
 MAX_DELAY = 15
+ARCHIVO_DATOS = "mis_datos.json"
 
 
 # ============================================================
 #                   MOTOR DEL BOT
 # ============================================================
 class BotEngine:
-    """Maneja IQ Option + Telegram en un hilo aparte con su propio asyncio loop.
-    La UI le habla por metodos thread-safe (schedule, provide_*)."""
+    """Maneja IQ Option + Telegram en su propio hilo con asyncio loop.
+    Plumbing del cimiento: ack emitter, executor, stop guard, settings."""
 
-    def __init__(self, datos_path, sesion_path, log_fn, estado_fn):
-        self.datos_path = datos_path
-        self.sesion_path = sesion_path
-        self.log_fn = log_fn          # callback(msg): UI agrega al log
-        self.estado_fn = estado_fn    # callback(nombre): UI cambia de pantalla
+    def __init__(self, app_dir, log_fn, estado_fn):
+        # Paths
+        self.app_dir = app_dir
+        self.datos_path = os.path.join(app_dir, ARCHIVO_DATOS)
+        self.sesion_path = os.path.join(app_dir, "seguidor_session")
+        self.db_path = os.path.join(app_dir, "seguidor_local.db")
+
+        # Callbacks a la UI
+        self.log_fn = log_fn
+        self.estado_fn = estado_fn
+
+        # SQLite + settings (no requieren IQ aun)
+        self.db = open_db(self.db_path)
+        self.settings = Settings(self.db)
+        # Por defecto bot activo
+        if self.settings.get("seguidor_activo") is None:
+            self.settings.set("seguidor_activo", True)
+
+        # Async / threading
         self.loop = None
         self.thread = None
+
+        # Conexiones (se rellenan en runtime)
         self.tg = None
         self.api = None
+        self.ack_emitter = None
+        self.tracker = None
+        self.executor = None
+        self.stop_guard = None
+
+        # Datos personales
         self.datos = None
+
+        # Telegram async coordination
         self._code_future = None
         self._pwd_future = None
         self._stop_event = None
-        # Candado para serializar las compras en IQ (la API no oficial no
-        # es thread-safe, en paralelo puede perder ordenes).
-        self._buy_lock = None
 
-    # ------- persistencia ---------
+    # ----- persistencia de IQ creds -------------------------------------
     def cargar_datos(self):
         if os.path.exists(self.datos_path):
             try:
@@ -83,8 +120,11 @@ class BotEngine:
         self.datos = datos
         with open(self.datos_path, "w", encoding="utf-8") as f:
             json.dump(datos, f, indent=2, ensure_ascii=False)
+        # Sincroniza monto a settings para uso live
+        if self.settings.get("monto") is None:
+            self.settings.set("monto", datos.get("monto", 5.0))
 
-    # ------- hilo del bot ---------
+    # ----- hilo dedicado -----------------------------------------------
     def iniciar_hilo(self):
         if self.thread and self.thread.is_alive():
             return
@@ -103,7 +143,7 @@ class BotEngine:
     def lanzar(self, coro):
         return asyncio.run_coroutine_threadsafe(coro, self.loop)
 
-    # ------- la UI pasa codigo / contrasena al loop --------
+    # ----- UI -> async loop (codigo / password) ------------------------
     def dar_codigo(self, codigo):
         if self._code_future and not self._code_future.done():
             self.loop.call_soon_threadsafe(self._code_future.set_result, codigo)
@@ -112,7 +152,7 @@ class BotEngine:
         if self._pwd_future and not self._pwd_future.done():
             self.loop.call_soon_threadsafe(self._pwd_future.set_result, pwd)
 
-    # ------- conexiones ---------
+    # ----- conexiones --------------------------------------------------
     async def _conectar_iq(self):
         self.log_fn("Conectando a IQ Option...")
 
@@ -129,13 +169,12 @@ class BotEngine:
 
         api = await self.loop.run_in_executor(None, _hacerlo)
         if not api:
-            self.log_fn("ERROR: no se pudo conectar a IQ Option. Revisa el correo/clave.")
+            self.log_fn("ERROR: no se pudo conectar a IQ Option.")
             return False
         self.api = api
         self.log_fn("IQ Option OK   |   saldo $%s" % api.get_balance())
 
-        # Carga TODOS los activos disponibles (incluye los nuevos como cripto,
-        # memecoins, etc. que no estan en la lista estatica de la libreria).
+        # Cargar TODOS los activos para soportar pares nuevos
         await self.loop.run_in_executor(None, self._refrescar_activos)
         return True
 
@@ -183,7 +222,7 @@ class BotEngine:
         try:
             codigo = await asyncio.wait_for(self._code_future, timeout=300)
         except asyncio.TimeoutError:
-            self.log_fn("Tiempo agotado esperando el codigo.")
+            self.log_fn("Timeout esperando codigo.")
             return False
 
         try:
@@ -194,7 +233,7 @@ class BotEngine:
             try:
                 pwd = await asyncio.wait_for(self._pwd_future, timeout=300)
             except asyncio.TimeoutError:
-                self.log_fn("Tiempo agotado esperando la contrasena.")
+                self.log_fn("Timeout password.")
                 return False
             try:
                 await self.tg.sign_in(password=pwd)
@@ -211,8 +250,24 @@ class BotEngine:
         self.log_fn("Telegram OK   |   " + (yo.first_name or "?"))
         return True
 
-    # ------- nucleo: escuchar y copiar ---------
+    # ----- handler de senales + executor ------------------------------
     async def _escuchar(self):
+        # Inicializa pipeline ahora que IQ y TG estan listos
+        self.ack_emitter = AckEmitter(self.db, self.tg, BOT_USERNAME_PANEL)
+        self.tracker = StateTracker(self.ack_emitter)
+        self.stop_guard = StopGuard(self.api, self.settings)
+
+        async def buy_async(signal):
+            monto_actual = self.settings.get_float(
+                "monto", self.datos.get("monto", 5.0))
+            return await self.loop.run_in_executor(
+                None, self._buy_sync,
+                monto_actual, signal["par"], signal["dir"],
+                int(signal.get("tf", 1)))
+
+        self.executor = TradeExecutor(
+            buy_async=buy_async, tracker=self.tracker)
+
         @self.tg.on(events.NewMessage(chats=TG_CANAL))
         async def manejador(event):
             texto = event.message.message or ""
@@ -222,51 +277,102 @@ class BotEngine:
                 s = json.loads(texto[len(PREFIJO):])
             except Exception:
                 return
-            par = s.get("par"); dir_ = s.get("dir"); tf = int(s.get("tf", 1))
+
+            signal_id = s.get("signal_id")
+            if not signal_id:
+                return
+
+            set_correlation(signal_id)
+
+            # Kill-switch manual: silencio total
+            if not self.settings.get_bool("seguidor_activo", True):
+                return
+
+            self.tracker.transition(signal_id, "recibida")
+
+            # v check
+            v = s.get("v", 1)
+            if v not in PROTO_SOPORTADO:
+                self.tracker.transition(signal_id, "fallida_sistema",
+                                         error="v_%s_unsupported" % v,
+                                         error_kind="system")
+                return
+
+            # dedupe persistente
+            try:
+                self.db.exec(
+                    "INSERT INTO processed_signals (signal_id, seen_at) "
+                    "VALUES (?, ?)", (signal_id, time.time()))
+            except sqlite3.IntegrityError:
+                self.tracker.transition(signal_id, "duplicada")
+                return
+
+            # stops
+            ok_stops, reason = self.stop_guard.check()
+            if not ok_stops:
+                self.log_fn("BLOQUEO por stop: %s" % reason)
+                self.tracker.transition(signal_id, "fallida_sistema",
+                                         error=reason, error_kind="system")
+                return
+
+            # payload + freshness
+            par = s.get("par")
+            direccion = s.get("dir")
+            tf = int(s.get("tf", 1))
+            if not par or direccion not in ("call", "put"):
+                self.tracker.transition(signal_id, "fallida_sistema",
+                                         error="invalid_payload",
+                                         error_kind="system")
+                return
+
             creado = int(s.get("creado", time.time()))
-            if not par or dir_ not in ("call", "put"):
-                return
             retraso = time.time() - creado
-            self.log_fn("SENAL: %s %s M%d  (retraso %.1fs)" % (par, dir_.upper(), tf, retraso))
             if retraso > MAX_DELAY:
-                self.log_fn("  DESCARTADA: vieja")
+                self.tracker.transition(signal_id, "fallida_sistema",
+                                         error="too_old_%ds" % int(retraso),
+                                         error_kind="system")
                 return
 
-            def _comprar():
-                if not self.api.check_connect():
-                    self.api.connect(); time.sleep(2)
-                return self.api.buy(self.datos["monto"], par, dir_, tf)
+            self.log_fn("SENAL %s %s M%d (retraso %.1fs)" % (
+                par, direccion.upper(), tf, retraso))
+            self.tracker.transition(signal_id, "validada")
 
-            # Serializa las compras: la API no oficial pisa su propio
-            # estado interno si dos buy() corren a la vez.
-            if self._buy_lock is None:
-                self._buy_lock = asyncio.Lock()
-            async with self._buy_lock:
-                ok, info = await self.loop.run_in_executor(None, _comprar)
-            if ok:
-                self.log_fn("  COPIADA  $%s  |  id %s" % (self.datos["monto"], info))
-            else:
-                self.log_fn("  ERROR: " + str(info))
+            # delegar al executor (queue + workers + retry)
+            if self.executor.submit(s):
+                self.stop_guard.increment_trades()
 
         async def heartbeat():
             while True:
                 try:
                     yo = await self.tg.get_me()
                     info = {"nombre": yo.first_name or "",
-                            "correo": self.datos["correo"],
-                            "cuenta": self.datos["cuenta"],
+                            "correo": self.datos.get("correo", ""),
+                            "cuenta": self.datos.get("cuenta", ""),
                             "saldo": self.api.get_balance()}
-                    await self.tg.send_message(BOT_USERNAME, "ESTADO " + json.dumps(info))
+                    await self.tg.send_message(BOT_USERNAME_PANEL,
+                                                "ESTADO " + json.dumps(info))
                 except Exception:
                     pass
                 await asyncio.sleep(600)
 
+        # tareas de background
         asyncio.create_task(heartbeat())
+        asyncio.create_task(self.ack_emitter.run())
+        asyncio.create_task(self.executor.start())
 
         self.estado_fn("escuchando")
-        self.log_fn("=== Esperando senales de la cuenta madre ===")
+        self.log_fn("=== Esperando senales ===")
         self._stop_event = asyncio.Event()
         await self._stop_event.wait()
+
+    def _buy_sync(self, monto, par, direccion, tf):
+        try:
+            if not self.api.check_connect():
+                self.api.connect()
+                time.sleep(2)
+            return self.api.buy(monto, par, direccion, tf)
+        except Exception as e:
+            return False, repr(e)
 
     async def correr(self, telefono=None):
         if not await self._login_telegram(telefono):
@@ -281,9 +387,9 @@ class BotEngine:
 #                    PANTALLAS DE LA UI
 # ============================================================
 def _input(**kw):
-    t = TextInput(multiline=False, write_tab=False,
-                  size_hint_y=None, height=dp(50), font_size=dp(18), **kw)
-    return t
+    return TextInput(multiline=False, write_tab=False,
+                     size_hint_y=None, height=dp(50),
+                     font_size=dp(18), **kw)
 
 
 def _titulo(txt):
@@ -344,7 +450,7 @@ class SetupScreen(Screen):
             return
         cuenta = "PRACTICE" if "PRACTICE" in self.cuenta.text else "REAL"
         self.app.engine.guardar_datos({"correo": c, "clave": k,
-                                       "cuenta": cuenta, "monto": monto})
+                                        "cuenta": cuenta, "monto": monto})
         self.app.ir_a_telegram_telefono()
 
 
@@ -352,7 +458,8 @@ class TelegramScreen(Screen):
     def __init__(self, app, **kw):
         super().__init__(**kw)
         self.app = app
-        self.layout = BoxLayout(orientation="vertical", padding=dp(20), spacing=dp(10))
+        self.layout = BoxLayout(orientation="vertical",
+                                 padding=dp(20), spacing=dp(10))
         self.add_widget(self.layout)
         self.modo = None
         self.set_modo("telefono")
@@ -369,7 +476,7 @@ class TelegramScreen(Screen):
             self.layout.add_widget(self.tel)
         elif modo == "codigo":
             self.layout.add_widget(Label(
-                text="Escribe el codigo que te llego\na tu app de Telegram:",
+                text="Escribe el codigo que llego\na tu app de Telegram:",
                 size_hint_y=None, height=dp(60), font_size=dp(15)))
             self.codigo = _input(input_filter="int")
             self.layout.add_widget(self.codigo)
@@ -419,16 +526,17 @@ class MainScreen(Screen):
         L = BoxLayout(orientation="vertical", padding=dp(16), spacing=dp(8))
         L.add_widget(_titulo("Bot Copy"))
         self.estado = Label(text="Iniciando...", size_hint_y=None,
-                            height=dp(40), color=(1, 0.8, 0.2, 1),
-                            font_size=dp(16))
+                             height=dp(40), color=(1, 0.8, 0.2, 1),
+                             font_size=dp(16))
         L.add_widget(self.estado)
         scroll = ScrollView()
         self.log = Label(text="", size_hint_y=None, font_size=dp(13),
-                         halign="left", valign="top", color=(0.9, 0.9, 0.9, 1))
+                          halign="left", valign="top",
+                          color=(0.9, 0.9, 0.9, 1))
         self.log.bind(width=lambda inst, val:
-                      setattr(inst, "text_size", (val - dp(8), None)))
+                       setattr(inst, "text_size", (val - dp(8), None)))
         self.log.bind(texture_size=lambda inst, val:
-                      setattr(inst, "height", val[1]))
+                       setattr(inst, "height", val[1]))
         scroll.add_widget(self.log)
         L.add_widget(scroll)
         self.add_widget(L)
@@ -439,7 +547,6 @@ class MainScreen(Screen):
             self.log.text = self.log.text + "\n[%s] %s" % (marca, msg)
         else:
             self.log.text = "[%s] %s" % (marca, msg)
-        # Limita a las ultimas 200 lineas
         lineas = self.log.text.split("\n")
         if len(lineas) > 200:
             self.log.text = "\n".join(lineas[-200:])
@@ -459,8 +566,7 @@ class CopyBotApp(App):
             pass
 
         self.engine = BotEngine(
-            datos_path=os.path.join(ddir, "mis_datos.json"),
-            sesion_path=os.path.join(ddir, "seguidor_session"),
+            app_dir=ddir,
             log_fn=self._log_thread_safe,
             estado_fn=self._estado_thread_safe,
         )
@@ -481,7 +587,6 @@ class CopyBotApp(App):
             self.sm.current = "setup"
         return self.sm
 
-    # --- callbacks que llaman desde el hilo del bot, deben rebotar al hilo UI ---
     def _log_thread_safe(self, msg):
         Clock.schedule_once(lambda dt: self.main_s.agregar_log(msg), 0)
 
@@ -511,7 +616,6 @@ class CopyBotApp(App):
             self.main_s.estado.text = "Error al conectar Telegram"
             self.main_s.estado.color = (1, 0.35, 0.35, 1)
 
-    # --- acciones que dispara la UI ---
     def ir_a_telegram_telefono(self):
         self.sm.current = "telegram"
         self.tg_s.set_modo("telefono")
@@ -521,6 +625,13 @@ class CopyBotApp(App):
 
     def _iniciar_sin_telefono(self):
         self.engine.lanzar(self.engine.correr(None))
+
+    def on_pause(self):
+        # Android: mantener la app viva en background
+        return True
+
+    def on_resume(self):
+        pass
 
     def on_stop(self):
         try:

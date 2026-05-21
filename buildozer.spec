@@ -6,11 +6,11 @@ package.domain = com.zayrex.copybot
 
 # Codigo fuente: esta misma carpeta
 source.dir = .
-source.include_exts = py,kv,json,pem,png,jpg,jpeg,atlas,ttf
-# Asegurar que iqoptionapi (paquete local) se incluya completo
-source.include_patterns = iqoptionapi/*,iqoptionapi/**/*
+source.include_exts = py,kv,json,pem,png,jpg,jpeg,atlas,ttf,sql
+# Incluye paquetes locales: iqoptionapi (broker) + core (cimiento) + migrations
+source.include_patterns = iqoptionapi/*,iqoptionapi/**/*,core/*,core/**/*,migrations/*
 
-version = 0.1
+version = 0.2
 
 # Dependencias de Python
 requirements = python3,kivy,requests,urllib3,charset-normalizer,certifi,idna,websocket-client,colorama,python-dateutil,six,telethon,pyaes,rsa,pyasn1
