@@ -227,7 +227,14 @@ class BotEngine:
             return False
 
         try:
-            await self.tg.sign_in(phone=telefono, code=codigo)
+            # Timeout duro para que sign_in NO se cuelgue eterno.
+            await asyncio.wait_for(
+                self.tg.sign_in(phone=telefono, code=codigo),
+                timeout=60)
+        except asyncio.TimeoutError:
+            self.log_fn("Timeout (60s) verificando el codigo. Reintenta.")
+            self.estado_fn("error_tg")
+            return False
         except SessionPasswordNeededError:
             self._pwd_future = self.loop.create_future()
             self.estado_fn("pedir_password")
@@ -237,7 +244,12 @@ class BotEngine:
                 self.log_fn("Timeout password.")
                 return False
             try:
-                await self.tg.sign_in(password=pwd)
+                await asyncio.wait_for(
+                    self.tg.sign_in(password=pwd), timeout=60)
+            except asyncio.TimeoutError:
+                self.log_fn("Timeout (60s) verificando contrasena.")
+                self.estado_fn("error_tg")
+                return False
             except Exception as e:
                 self.log_fn("ERROR contrasena: " + repr(e))
                 self.estado_fn("error_tg")
@@ -247,8 +259,13 @@ class BotEngine:
             self.estado_fn("error_tg")
             return False
 
-        yo = await self.tg.get_me()
-        self.log_fn("Telegram OK   |   " + (yo.first_name or "?"))
+        try:
+            yo = await asyncio.wait_for(self.tg.get_me(), timeout=30)
+        except asyncio.TimeoutError:
+            self.log_fn("Timeout get_me. Reintentando como exitoso.")
+            yo = None
+        nombre = (yo.first_name if yo else "OK")
+        self.log_fn("Telegram OK   |   " + nombre)
         return True
 
     # ------------------------------------------------------------------
@@ -395,6 +412,9 @@ class BotEngine:
     async def correr(self, telefono=None):
         if not await self._login_telegram(telefono):
             return
+        # ←  Cambia YA a Main con feedback "Conectando IQ..."
+        #     asi el usuario no queda colgado en "Verificando..." en TelegramScreen.
+        self.estado_fn("conectando_iq")
         if not await self._conectar_iq():
             self.estado_fn("error_iq")
             return
@@ -945,6 +965,12 @@ class CopyBotApp(App):
         elif nombre == "pedir_password":
             self.sm.current = "telegram"
             self.tg_s.set_modo("password")
+        elif nombre == "conectando_iq":
+            # Apenas Telegram esta listo, saca al usuario de TelegramScreen
+            # y muestrale que avanza con la conexion IQ.
+            self.sm.current = "main"
+            self.main_s.estado.text = "⏳ Telegram OK, conectando IQ Option..."
+            self.main_s.estado.color = (1, 0.8, 0.2, 1)
         elif nombre == "escuchando":
             self.sm.current = "main"
             self.main_s.estado.text = "🟢 Conectado - escuchando senales"
@@ -979,10 +1005,10 @@ class CopyBotApp(App):
         return True
 
     def on_resume(self):
-        """Combate AGRESIVO contra la pantalla negra de SDL2.
-        Programa multiples redibujos en distintos delays para asegurar
-        que el contexto OpenGL se restaure."""
-        log.info("on_resume_aggressive_redraw")
+        """Redraws sin bounce. El bounce anterior pisaba transiciones
+        que el engine hacia en background -> el usuario quedaba colgado
+        en pantallas viejas."""
+        log.info("on_resume_redraw")
         try:
             from kivy.core.window import Window
 
@@ -991,30 +1017,13 @@ class CopyBotApp(App):
                     Window.canvas.ask_update()
                     if self.root:
                         self.root.canvas.ask_update()
-                        self.root.do_layout()
                 except Exception:
                     pass
 
-            # Multiples disparos para asegurar que en algun momento Kivy
-            # reciba el contexto OpenGL y pinte.
-            for delay in (0.0, 0.1, 0.3, 0.6, 1.0, 2.0):
+            # Multiples redibujos para combatir la pantalla negra,
+            # SIN tocar ScreenManager (eso lo controla el engine).
+            for delay in (0.0, 0.2, 0.5, 1.0):
                 Clock.schedule_once(_redraw, delay)
-
-            # Truco de "rebote" del ScreenManager: cambiar a otra pantalla
-            # y volver. Fuerza recreate de widgets visibles.
-            def _bounce(_dt=None):
-                try:
-                    if not hasattr(self, "sm"):
-                        return
-                    actual = self.sm.current
-                    if actual != "loading":
-                        self.sm.current = "loading"
-                        Clock.schedule_once(
-                            lambda dt: setattr(self.sm, "current", actual), 0.15)
-                except Exception:
-                    pass
-            Clock.schedule_once(_bounce, 0.4)
-
         except Exception as e:
             log.warning("on_resume_failed: " + repr(e))
 
