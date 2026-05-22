@@ -856,22 +856,37 @@ class CopyBotApp(App):
                 pass
 
     def _intentar_servicio(self, _dt):
-        """Arranca el foreground service en Android. Falla silenciosamente
-        si no se puede — la app sigue funcionando aunque mas vulnerable
-        a que Android la mate en background."""
+        """Arranca el foreground service en Android con diagnostico completo."""
         if platform != "android":
             return
         try:
-            from jnius import autoclass
+            from jnius import autoclass, JavaClass
         except Exception as e:
             log.warning("jnius_not_available: " + repr(e))
             return
 
-        # p4a genera el class name como {domain}.{package}.Service{Name}.
-        # Probamos varios prefijos por si la convencion cambia.
+        # 1) Pedir permiso POST_NOTIFICATIONS (Android 13+) en runtime.
+        #    Sin esto la notif del foreground service no aparece.
+        try:
+            from android.permissions import (request_permissions, Permission,
+                                              check_permission)
+            try:
+                if not check_permission("android.permission.POST_NOTIFICATIONS"):
+                    request_permissions([
+                        Permission.POST_NOTIFICATIONS
+                    ])
+                    log.info("post_notifications_requested")
+            except Exception as e:
+                # POST_NOTIFICATIONS solo existe en Android 13+
+                log.info("post_notifications_skip: " + str(e)[:80])
+        except Exception as e:
+            log.info("android_permissions_module_unavailable: " + str(e)[:80])
+
+        # 2) Buscar la clase del service. p4a tiene varios patrones.
         candidatos = [
             "com.zayrex.copybot.copybot.ServiceCopybot",
             "com.zayrex.copybot.ServiceCopybot",
+            "com.zayrex.copybot.copybot.ServiceCopyBot",
             "org.copybot.ServiceCopybot",
         ]
         service_cls = None
@@ -880,26 +895,39 @@ class CopyBotApp(App):
                 service_cls = autoclass(nombre)
                 log.info("service_class_found: " + nombre)
                 break
-            except Exception:
-                continue
+            except Exception as e:
+                log.info("service_class_try_fail: %s -> %s" % (
+                    nombre, str(e)[:60]))
+
         if service_cls is None:
-            log.warning("service_class_not_found_in_any_path")
+            log.warning("service_class_NOT_FOUND_anywhere")
+            # Diagnostico extra: listar lo que SI esta en jnius
+            try:
+                ctx = autoclass("org.kivy.android.PythonActivity").mActivity
+                pkg = ctx.getPackageName()
+                log.warning("running_package: " + str(pkg))
+            except Exception:
+                pass
             return
 
         try:
             activity = autoclass("org.kivy.android.PythonActivity").mActivity
             Intent = autoclass("android.content.Intent")
             intent = Intent(activity, service_cls)
-            # En Android 8+ usar startForegroundService para apps en bg
+            # Argumento que pasa p4a al script: ruta al data dir
+            intent.putExtra("pythonServiceArgument", "")
             try:
                 activity.startForegroundService(intent)
-                log.info("startForegroundService_ok")
-            except Exception:
-                # Fallback Android < 8 o si falla la version foreground
-                activity.startService(intent)
-                log.info("startService_ok")
+                log.info("startForegroundService_OK")
+            except Exception as e:
+                log.warning("startForegroundService_fail: " + str(e)[:80])
+                try:
+                    activity.startService(intent)
+                    log.info("startService_OK_fallback")
+                except Exception as e2:
+                    log.warning("startService_fallback_fail: " + str(e2)[:80])
         except Exception as e:
-            log.warning("foreground_service_failed: " + repr(e))
+            log.warning("foreground_service_pipeline_fail: " + repr(e))
 
     def _log_thread_safe(self, msg):
         Clock.schedule_once(lambda dt: self.main_s.agregar_log(msg), 0)
@@ -941,42 +969,54 @@ class CopyBotApp(App):
         self.engine.lanzar(self.engine.correr(None))
 
     def on_pause(self):
-        """on_pause CONDICIONAL segun pantalla:
-
-        - En TelegramScreen (login en curso, usuario va a Telegram a ver
-          el codigo): devolvemos True para que Android NO mate el proceso.
-          Necesitamos seguir vivos para que el usuario regrese y escriba.
-
-        - En cualquier otra pantalla (Main, Settings, Setup): devolvemos
-          False. Android mata el proceso -> proxima apertura es fresh ->
-          sin pantalla negra de SDL.
-        """
-        try:
-            current = self.sm.current
-        except Exception:
-            current = None
-        if current == "telegram":
-            log.info("on_pause: keep alive (login en curso)")
-            return True
-        log.info("on_pause: fresh start (current=%s)" % current)
-        return False
+        """SIEMPRE True: mantener el proceso vivo cuando va a background.
+        Esto permite que:
+          - El usuario pueda salir a Telegram a ver el codigo y volver.
+          - El bot siga operando cuando se minimiza la app.
+        El precio: posible pantalla negra al volver. Lo combatimos en
+        on_resume con redraw agresivo."""
+        log.info("on_pause: keep_alive=True")
+        return True
 
     def on_resume(self):
-        """Si el proceso sobrevivio el pause, fuerza redraw para combatir
-        la pantalla negra de SDL2 al volver de background."""
+        """Combate AGRESIVO contra la pantalla negra de SDL2.
+        Programa multiples redibujos en distintos delays para asegurar
+        que el contexto OpenGL se restaure."""
+        log.info("on_resume_aggressive_redraw")
         try:
             from kivy.core.window import Window
-            Window.canvas.ask_update()
-            if self.root:
-                self.root.canvas.ask_update()
-                # Trick adicional: re-asignar el current al ScreenManager
-                # para forzar transicion y repintado completo.
-                if hasattr(self, "sm") and self.sm.current:
+
+            def _redraw(_dt=None):
+                try:
+                    Window.canvas.ask_update()
+                    if self.root:
+                        self.root.canvas.ask_update()
+                        self.root.do_layout()
+                except Exception:
+                    pass
+
+            # Multiples disparos para asegurar que en algun momento Kivy
+            # reciba el contexto OpenGL y pinte.
+            for delay in (0.0, 0.1, 0.3, 0.6, 1.0, 2.0):
+                Clock.schedule_once(_redraw, delay)
+
+            # Truco de "rebote" del ScreenManager: cambiar a otra pantalla
+            # y volver. Fuerza recreate de widgets visibles.
+            def _bounce(_dt=None):
+                try:
+                    if not hasattr(self, "sm"):
+                        return
                     actual = self.sm.current
-                    self.sm.current = actual
-            log.info("on_resume_forced_redraw")
+                    if actual != "loading":
+                        self.sm.current = "loading"
+                        Clock.schedule_once(
+                            lambda dt: setattr(self.sm, "current", actual), 0.15)
+                except Exception:
+                    pass
+            Clock.schedule_once(_bounce, 0.4)
+
         except Exception as e:
-            log.warning("on_resume_redraw_failed: " + repr(e))
+            log.warning("on_resume_failed: " + repr(e))
 
     def on_stop(self):
         try:
