@@ -749,10 +749,18 @@ class SettingsScreen(Screen):
 
 
 class LoadingScreen(Screen):
-    """Pantalla mostrada antes de inicializar nada. Evita black-screen."""
+    """Pantalla mostrada antes de inicializar nada. Evita black-screen.
+    Fondo azul para que si hay bug de SDL la pantalla NO sea 100% negra."""
 
     def __init__(self, **kw):
         super().__init__(**kw)
+        # Pintar fondo azul para distinguir 'cargando' de 'roto'
+        from kivy.graphics import Color, Rectangle
+        with self.canvas.before:
+            Color(0.10, 0.16, 0.27, 1)  # azul oscuro Tailwind slate-900
+            self._bg = Rectangle(size=self.size, pos=self.pos)
+        self.bind(size=self._update_bg, pos=self._update_bg)
+
         L = BoxLayout(orientation="vertical", padding=dp(40))
         L.add_widget(Label(text="", size_hint_y=1))
         L.add_widget(Label(text="[b]Bot Copy[/b]", markup=True,
@@ -760,9 +768,17 @@ class LoadingScreen(Screen):
         L.add_widget(Label(text="", size_hint_y=None, height=dp(12)))
         L.add_widget(Label(text="⏳ Cargando...",
                             font_size=dp(16), size_hint_y=None, height=dp(30),
-                            color=(0.7, 0.7, 0.8, 1)))
+                            color=(0.7, 0.85, 1.0, 1)))
+        L.add_widget(Label(text="(si esta pantalla persiste 30s,\n"
+                                "cierra y reabre la app)",
+                            font_size=dp(11), size_hint_y=None, height=dp(40),
+                            color=(0.5, 0.6, 0.7, 1)))
         L.add_widget(Label(text="", size_hint_y=1))
         self.add_widget(L)
+
+    def _update_bg(self, *_):
+        self._bg.size = self.size
+        self._bg.pos = self.pos
 
 
 # ============================================================
@@ -917,11 +933,27 @@ class CopyBotApp(App):
         self.engine.lanzar(self.engine.correr(None))
 
     def on_pause(self):
-        # Android: mantener viva la app cuando va a background
-        return True
+        # IMPORTANTE: devolvemos FALSE para que Android mate el proceso
+        # cuando vamos a background. Sin esto, SDL2 pierde el contexto
+        # OpenGL y al regresar queda pantalla NEGRA (bug clasico Kivy).
+        #
+        # El bot sigue corriendo en background gracias al foreground
+        # service (otro proceso). La UI es solo "viewer".
+        #
+        # En cada apertura del app es un fresh start: sin pantalla negra.
+        return False
 
     def on_resume(self):
-        pass
+        # Por si Android decide NO matar el proceso a pesar de on_pause=False,
+        # forzamos un repintado para combatir la pantalla negra.
+        try:
+            from kivy.core.window import Window
+            Window.canvas.ask_update()
+            if self.root:
+                self.root.canvas.ask_update()
+            log.info("on_resume_forced_redraw")
+        except Exception:
+            pass
 
     def on_stop(self):
         try:
