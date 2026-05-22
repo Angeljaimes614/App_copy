@@ -509,6 +509,14 @@ class TelegramScreen(Screen):
                 size_hint_y=None, height=dp(60), font_size=dp(15)))
             self.codigo = _input(input_filter="int")
             self.layout.add_widget(self.codigo)
+            # TIP importante: el codigo aparece en la PREVIEW de la
+            # notificacion de Telegram sin tener que abrir la app.
+            self.layout.add_widget(Label(
+                text="💡 Tip: el codigo aparece en la notificacion\n"
+                     "de Telegram. Bajalo desde la barra de arriba\n"
+                     "sin tener que abrir la app de Telegram.",
+                size_hint_y=None, height=dp(70), font_size=dp(12),
+                color=(0.7, 0.85, 1.0, 1)))
         elif modo == "password":
             self.layout.add_widget(Label(
                 text="Tu contrasena de Telegram\n(verificacion en 2 pasos):",
@@ -933,27 +941,42 @@ class CopyBotApp(App):
         self.engine.lanzar(self.engine.correr(None))
 
     def on_pause(self):
-        # IMPORTANTE: devolvemos FALSE para que Android mate el proceso
-        # cuando vamos a background. Sin esto, SDL2 pierde el contexto
-        # OpenGL y al regresar queda pantalla NEGRA (bug clasico Kivy).
-        #
-        # El bot sigue corriendo en background gracias al foreground
-        # service (otro proceso). La UI es solo "viewer".
-        #
-        # En cada apertura del app es un fresh start: sin pantalla negra.
+        """on_pause CONDICIONAL segun pantalla:
+
+        - En TelegramScreen (login en curso, usuario va a Telegram a ver
+          el codigo): devolvemos True para que Android NO mate el proceso.
+          Necesitamos seguir vivos para que el usuario regrese y escriba.
+
+        - En cualquier otra pantalla (Main, Settings, Setup): devolvemos
+          False. Android mata el proceso -> proxima apertura es fresh ->
+          sin pantalla negra de SDL.
+        """
+        try:
+            current = self.sm.current
+        except Exception:
+            current = None
+        if current == "telegram":
+            log.info("on_pause: keep alive (login en curso)")
+            return True
+        log.info("on_pause: fresh start (current=%s)" % current)
         return False
 
     def on_resume(self):
-        # Por si Android decide NO matar el proceso a pesar de on_pause=False,
-        # forzamos un repintado para combatir la pantalla negra.
+        """Si el proceso sobrevivio el pause, fuerza redraw para combatir
+        la pantalla negra de SDL2 al volver de background."""
         try:
             from kivy.core.window import Window
             Window.canvas.ask_update()
             if self.root:
                 self.root.canvas.ask_update()
+                # Trick adicional: re-asignar el current al ScreenManager
+                # para forzar transicion y repintado completo.
+                if hasattr(self, "sm") and self.sm.current:
+                    actual = self.sm.current
+                    self.sm.current = actual
             log.info("on_resume_forced_redraw")
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning("on_resume_redraw_failed: " + repr(e))
 
     def on_stop(self):
         try:

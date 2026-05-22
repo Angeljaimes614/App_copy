@@ -10,7 +10,7 @@ source.include_exts = py,kv,json,pem,png,jpg,jpeg,atlas,ttf,sql
 # Incluye paquetes locales: iqoptionapi (broker) + core (cimiento) + migrations
 source.include_patterns = iqoptionapi/*,iqoptionapi/**/*,core/*,core/**/*,migrations/*
 
-version = 0.3.2
+version = 0.3.3
 
 # Dependencias de Python
 requirements = python3,kivy,requests,urllib3,charset-normalizer,certifi,idna,websocket-client,colorama,python-dateutil,six,telethon,pyaes,rsa,pyasn1
